@@ -21,7 +21,7 @@ from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 LOG = logging.getLogger("feddx.clinical_cases")
 DEFAULT_MODEL = "google/gemma-4-12B-it"
-PROMPT_VERSION = "clinician-v1"
+PROMPT_VERSION = "clinician-v2"
 
 SYSTEM_PROMPT = """You write concise THIRD-PERSON clinical case summaries from decoded
 questionnaire evidence for a synthetic medical research dataset.
@@ -30,8 +30,14 @@ Rules:
 - Use ONLY supplied information. Do not infer a diagnosis, differential, prognosis,
   examination result, treatment, duration, or severity not explicitly supplied.
 - Do not mention the diagnosis or guess the likely condition.
-- Express a YES answer to an 'A or B' question as 'A or B' (never assert both,
-  and never select one without support). Keep other uncertainties explicit.
+- A YES to a question with alternatives (A OR B) establishes AT LEAST ONE,
+  NOT both and NOT a specific alternative. Never rewrite A OR B as A AND B,
+  A WITH B, or as two confirmed findings. Preserve the original OR uncertainty.
+  Example: 'asthma OR previous bronchodilator use' must NOT become
+  'asthma (with previous bronchodilator use)'.
+- A multi-select answer listing selected items may establish each selected item;
+  do not mistake a list of selected answers for alternatives in a question.
+- Do not invent additional history, time courses, or relationships.
 - Preserve negative findings if explicitly given; missing facts are unknown.
 - Clinical-history items describe history, not new or current symptoms.
 - Use precise, readable clinician language. Avoid verbatim questionnaire questions,
@@ -85,7 +91,8 @@ def make_messages(public_input: dict) -> list[dict]:
     text = (
         "Write a clinician-style summary of the following patient evidence. "
         "Present current symptoms and relevant medical history separately. "
-        "Preserve disjunctions such as 'or', avoid unsupported specificity, and "
+        "A positive OR question confirms at least one alternative, never both. "
+        "Preserve uncertainty and avoid unsupported specificity; "
         "do not write a diagnosis. Keep each section compact and complete.\n\n"
         + json.dumps(public_input, ensure_ascii=False)
     )
@@ -154,23 +161,74 @@ def completed_ids(path: Path) -> set[str]:
     return ids
 
 
-def generate(model, processor, public_input: dict, args) -> dict[str, str]:
+def generate_batch(model, processor, public_inputs: list[dict], args) -> list[dict[str, str] | Exception]:
+    """Generate a padded batch. Parse each output independently for targeted retries."""
+    conversations = [make_messages(public_input) for public_input in public_inputs]
     encoded = processor.apply_chat_template(
-        make_messages(public_input), tokenize=True,
-        add_generation_prompt=True, return_dict=True, return_tensors="pt"
+        conversations if len(conversations) > 1 else conversations[0],
+        tokenize=True, add_generation_prompt=True, return_dict=True,
+        return_tensors="pt", padding=True,
     ).to(model.device)
     kwargs = {
         "max_new_tokens": args.max_new_tokens,
         "do_sample": args.temperature > 0,
-        "pad_token_id": processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id,
+        "pad_token_id": processor.tokenizer.pad_token_id
+            if processor.tokenizer.pad_token_id is not None
+            else processor.tokenizer.eos_token_id,
     }
     if args.temperature > 0:
         kwargs["temperature"] = args.temperature
     with torch.inference_mode():
-        result = model.generate(**encoded, **kwargs)
-    completion = processor.decode(result[0, encoded["input_ids"].shape[-1]:], skip_special_tokens=True)
-    del encoded, result
-    return parse_output(completion)
+        generated = model.generate(**encoded, **kwargs)
+    # The output includes the entire padded input, even for shorter prompts.
+    prefix_length = encoded["input_ids"].shape[1]
+    completions = processor.batch_decode(
+        generated[:, prefix_length:], skip_special_tokens=True
+    )
+    del encoded, generated
+    parsed = []
+    for completion in completions:
+        try:
+            parsed.append(parse_output(completion))
+        except ValueError as exc:
+            parsed.append(exc)
+    return parsed
+
+
+def generate_with_retries(model, processor, public_input: dict, args, patient_id: str):
+    for attempt in range(args.retries + 1):
+        try:
+            parsed = generate_batch(model, processor, [public_input], args)[0]
+            if not isinstance(parsed, Exception):
+                return parsed
+            raise parsed
+        except ValueError as exc:
+            LOG.warning("%s attempt %d rejected: %s", patient_id, attempt + 1, exc)
+    return None
+
+
+def generate_pending(model, processor, pending: list[tuple], args):
+    """Batch first, then retry only invalid cases individually.
+
+    If the optional batch exhausts VRAM, retry each case singly and keep going.
+    """
+    if len(pending) == 1:
+        item, generation_input, public_input, flags = pending[0]
+        return [(pending[0], generate_with_retries(model, processor, public_input, args,
+                                                   generation_input["patient_id"]))]
+    try:
+        outcomes = generate_batch(model, processor, [entry[2] for entry in pending], args)
+    except torch.OutOfMemoryError:
+        LOG.warning("Batch size %d exhausted GPU memory; falling back to single cases", len(pending))
+        torch.cuda.empty_cache()
+        outcomes = [ValueError("batch GPU memory exhausted") for _ in pending]
+    results = []
+    for entry, outcome in zip(pending, outcomes):
+        if isinstance(outcome, Exception):
+            LOG.warning("%s batched response rejected: %s; retrying alone", entry[1]["patient_id"], outcome)
+            outcome = generate_with_retries(model, processor, entry[2], args, entry[1]["patient_id"])
+        results.append((entry, outcome))
+    return results
 
 
 def main() -> None:
@@ -181,14 +239,18 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max-records", type=int, default=20, help="Maximum NEW cases this run; 0 for all")
     parser.add_argument("--offset", type=int, default=0, help="Skip first N input records")
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--max-new-tokens", type=int, default=512,
+                        help="Token budget per summary; increase for very complex cases")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Cases per generation batch (try 2 on L40S; 1 is safest)")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="0 enables deterministic greedy decoding (faster)")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    if args.max_records < 0 or args.offset < 0 or args.retries < 0 or args.max_new_tokens < 64:
-        parser.error("Invalid limits: max-records/offset/retries must be nonnegative; max-new-tokens >= 64")
+    if args.max_records < 0 or args.offset < 0 or args.retries < 0 or args.max_new_tokens < 64 or args.batch_size < 1:
+        parser.error("Invalid limits: max-records/offset/retries must be nonnegative; max-new-tokens >= 64; batch-size >= 1")
     if not 0 <= args.temperature <= 2:
         parser.error("temperature must be 0–2")
     if args.resume and args.overwrite:
@@ -211,8 +273,51 @@ def main() -> None:
         args.model, dtype=torch.bfloat16, device_map="auto"
     )
     model.eval()
+    # Decoder-only causal models require left padding for batched inference.
+    processor.tokenizer.padding_side = "left"
     successes = failures = skipped = 0
-    with source.open(encoding="utf-8") as inp, output.open("a" if args.resume else "w", encoding="utf-8") as out:
+    pending = []
+
+    def write_pending(out):
+        nonlocal successes, failures
+        if not pending:
+            return
+        for (item, generation_input, public_input, flags), sections in generate_pending(
+            model, processor, pending, args
+        ):
+            if sections is None:
+                failures += 1
+                continue
+            patient_id = generation_input["patient_id"]
+            features = generation_input.get("patient_features", {})
+            record = {
+                "patient_id": patient_id,
+                "patient_features": features,
+                "clinical_summary": format_summary(features, sections),
+                "presenting_findings": sections["presenting_findings"],
+                "relevant_history": sections["relevant_history"],
+                "clinical_evidence": generation_input.get("clinical_evidence", []),
+                "target": item["target"],
+                "generation_metadata": {
+                    "model": args.model, "prompt_version": PROMPT_VERSION,
+                    "max_new_tokens": args.max_new_tokens,
+                    "temperature": args.temperature,
+                    "batch_size": args.batch_size,
+                    "quality_flags": flags,
+                    "validation": "json_structure_and_scale_language_only_not_clinically_verified",
+                },
+            }
+            out.write(json.dumps(record, ensure_ascii=False) + "\n")
+            out.flush()
+            done.add(patient_id)
+            successes += 1
+            if successes % 10 == 0:
+                LOG.info("Generated=%d, skipped=%d, failed=%d", successes, skipped, failures)
+        pending.clear()
+
+    with source.open(encoding="utf-8") as inp, output.open(
+        "a" if args.resume else "w", encoding="utf-8"
+    ) as out:
         for index, line in enumerate(inp):
             if index < args.offset or not line.strip():
                 continue
@@ -225,37 +330,11 @@ def main() -> None:
                 skipped += 1
                 continue
             public_input, flags = make_public_input(generation_input)
-            sections = None
-            for attempt in range(args.retries + 1):
-                try:
-                    sections = generate(model, processor, public_input, args)
-                    break
-                except ValueError as exc:
-                    LOG.warning("%s attempt %d rejected: %s", patient_id, attempt + 1, exc)
-            if sections is None:
-                failures += 1
-                continue
-            record = {
-                "patient_id": patient_id,
-                "patient_features": generation_input.get("patient_features", {}),
-                "clinical_summary": format_summary(generation_input.get("patient_features", {}), sections),
-                "presenting_findings": sections["presenting_findings"],
-                "relevant_history": sections["relevant_history"],
-                "clinical_evidence": generation_input.get("clinical_evidence", []),
-                "target": item["target"],
-                "generation_metadata": {
-                    "model": args.model, "prompt_version": PROMPT_VERSION,
-                    "max_new_tokens": args.max_new_tokens, "temperature": args.temperature,
-                    "quality_flags": flags,
-                    "validation": "json_structure_and_scale_language_only_not_clinically_verified",
-                },
-            }
-            out.write(json.dumps(record, ensure_ascii=False) + "\n")
-            out.flush()
-            done.add(patient_id)
-            successes += 1
-            if successes % 10 == 0:
-                LOG.info("Generated=%d, skipped=%d, failed=%d", successes, skipped, failures)
+            pending.append((item, generation_input, public_input, flags))
+            remaining = args.max_records - successes if args.max_records else args.batch_size
+            if len(pending) >= min(args.batch_size, remaining):
+                write_pending(out)
+        write_pending(out)
     LOG.info("Finished: generated=%d skipped=%d failed=%d file=%s", successes, skipped, failures, output)
 
 
