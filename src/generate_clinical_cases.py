@@ -11,6 +11,12 @@ The model NEVER receives the target diagnosis or differential diagnoses.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import heapq
+import math
+import os
+import random
+from collections import Counter
 import json
 import logging
 import re
@@ -161,13 +167,103 @@ def completed_ids(path: Path) -> set[str]:
     return ids
 
 
+
+def source_records(source: Path):
+    """Iterate input in stable order with minimal memory overhead."""
+    with source.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
+def source_signature(source: Path) -> dict:
+    stat = source.stat()
+    return {"bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def build_selection_plan(source: Path, output: Path, args, done: set[str]) -> dict:
+    """Select additional unique source IDs; never change a saved plan on resume.
+
+    natural: uniformly sample records without replacement.
+    hybrid: weight each record by 1/sqrt(source_class_frequency), increasing
+            representation of rare diagnoses without enforcing equality.
+    """
+    plan_path = args.output_dir / f"{args.split}.selection.json"
+    signature = source_signature(source)
+    if plan_path.exists() and not args.overwrite:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        expected = {"strategy": args.sampling, "seed": args.seed,
+                    "target_total": args.target_total, "source_signature": signature}
+        for name, value in expected.items():
+            if plan.get(name) != value:
+                raise ValueError(f"Saved sampling plan disagrees on {name}; use the original settings or a new output directory")
+        selected = plan["selected_ids"]
+        if len(selected) != len(set(selected)):
+            raise ValueError("Saved sampling plan contains duplicate patient IDs")
+        return plan
+
+    if args.resume and plan_path.exists():
+        raise ValueError("Cannot safely replace an existing selection plan")
+    needed = args.target_total - len(done)
+    if needed <= 0:
+        selected = []
+        counts = Counter()
+    else:
+        counts = Counter()
+        candidate_total = 0
+        seen_ids = set(done)
+        for item in source_records(source):
+            pid = item["generation_input"]["patient_id"]
+            if pid in seen_ids:
+                if pid not in done:
+                    raise ValueError(f"Duplicate source patient ID: {pid}")
+                continue
+            seen_ids.add(pid)
+            label = item["target"]["diagnosis"]
+            counts[label] += 1
+            candidate_total += 1
+        if needed > candidate_total:
+            raise ValueError(f"Need {needed} more cases but only {candidate_total} source cases remain")
+        rng = random.Random(args.seed)
+        # Weighted reservoir sampling via random exponential keys.
+        # Keep the smallest 'needed' keys in a bounded max heap.
+        heap = []
+        for item in source_records(source):
+            pid = item["generation_input"]["patient_id"]
+            if pid in done:
+                continue
+            label = item["target"]["diagnosis"]
+            weight = counts[label] ** (-0.5 if args.sampling == "hybrid" else 0.0)
+            key = -math.log(max(rng.random(), 1e-300)) / weight
+            entry = (-key, pid)
+            if len(heap) < needed:
+                heapq.heappush(heap, entry)
+            elif entry > heap[0]:
+                heapq.heapreplace(heap, entry)
+        selected = [pid for _, pid in heap]
+    plan = {
+        "version": 1, "strategy": args.sampling, "seed": args.seed,
+        "target_total": args.target_total, "source_signature": signature,
+        "initial_output_count": len(done), "selected_ids": sorted(selected),
+        "candidate_diagnosis_counts": dict(counts),
+    }
+    temp = plan_path.with_suffix(plan_path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, plan_path)
+    LOG.info("Saved %s sampling plan: %d additional patients, %d existing", args.sampling, len(selected), len(done))
+    return plan
+
+
 def generate_batch(model, processor, public_inputs: list[dict], args) -> list[dict[str, str] | Exception]:
     """Generate a padded batch. Parse each output independently for targeted retries."""
     conversations = [make_messages(public_input) for public_input in public_inputs]
     encoded = processor.apply_chat_template(
         conversations if len(conversations) > 1 else conversations[0],
         tokenize=True, add_generation_prompt=True, return_dict=True,
-        return_tensors="pt", padding=True,
+        return_tensors="pt", processor_kwargs={"padding": True},
     ).to(model.device)
     kwargs = {
         "max_new_tokens": args.max_new_tokens,
@@ -238,7 +334,14 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("data/generated_clinical"))
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max-records", type=int, default=20, help="Maximum NEW cases this run; 0 for all")
-    parser.add_argument("--offset", type=int, default=0, help="Skip first N input records")
+    parser.add_argument("--offset", type=int, default=0, help="Skip first N input records (sequential mode only)")
+    parser.add_argument("--sampling", choices=["sequential", "natural", "hybrid"], default="sequential",
+                        help="natural: seeded uniform sample; hybrid: gently boost rare diagnoses")
+    parser.add_argument("--target-total", type=int, default=None,
+                        help="Total desired output cases; required for natural/hybrid selection")
+    parser.add_argument("--seed", type=int, default=42, help="Stable random sampling seed")
+    parser.add_argument("--plan-only", action="store_true",
+                        help="Build/reuse selection plan and report counts, without loading Gemma")
     parser.add_argument("--max-new-tokens", type=int, default=512,
                         help="Token budget per summary; increase for very complex cases")
     parser.add_argument("--batch-size", type=int, default=1,
@@ -251,6 +354,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_records < 0 or args.offset < 0 or args.retries < 0 or args.max_new_tokens < 64 or args.batch_size < 1:
         parser.error("Invalid limits: max-records/offset/retries must be nonnegative; max-new-tokens >= 64; batch-size >= 1")
+    if args.sampling != "sequential" and args.target_total is None:
+        parser.error("--target-total is required for natural/hybrid")
+    if args.target_total is not None and args.target_total <= 0:
+        parser.error("--target-total must be positive")
+    if args.sampling != "sequential" and args.offset:
+        parser.error("--offset is not supported with natural/hybrid; sampling covers the full source")
+    if args.plan_only and args.sampling == "sequential":
+        parser.error("--plan-only requires natural or hybrid")
     if not 0 <= args.temperature <= 2:
         parser.error("temperature must be 0–2")
     if args.resume and args.overwrite:
@@ -265,6 +376,23 @@ def main() -> None:
     if output.exists() and not (args.resume or args.overwrite):
         parser.error(f"{output} already exists; use --resume or --overwrite")
     done = completed_ids(output) if args.resume else set()
+    selected_ids = None
+    if args.sampling != "sequential":
+        try:
+            plan = build_selection_plan(source, output, args, done)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        selected_ids = set(plan["selected_ids"])
+        LOG.info("Plan: %d selected; %d already generated; %d still selected and missing",
+                 len(selected_ids), len(done), len(selected_ids - done))
+        if args.plan_only:
+            return
+        if args.target_total <= len(done):
+            LOG.info("Target reached: %d / %d", len(done), args.target_total)
+            return
+    elif args.target_total is not None and len(done) >= args.target_total:
+        LOG.info("Target reached: %d / %d", len(done), args.target_total)
+        return
     if not torch.cuda.is_available():
         parser.error("CUDA GPU unavailable")
     LOG.info("Loading %s", args.model)
@@ -323,19 +451,27 @@ def main() -> None:
                 continue
             if args.max_records and successes >= args.max_records:
                 break
+            if args.target_total is not None and len(done) >= args.target_total:
+                break
             item = json.loads(line)
             generation_input = item["generation_input"]
             patient_id = generation_input["patient_id"]
-            if patient_id in done:
+            if patient_id in done or (selected_ids is not None and patient_id not in selected_ids):
                 skipped += 1
                 continue
             public_input, flags = make_public_input(generation_input)
             pending.append((item, generation_input, public_input, flags))
             remaining = args.max_records - successes if args.max_records else args.batch_size
-            if len(pending) >= min(args.batch_size, remaining):
+            if args.target_total is not None:
+                remaining = min(remaining, args.target_total - len(done))
+            if len(pending) >= min(args.batch_size, max(1, remaining)):
                 write_pending(out)
         write_pending(out)
-    LOG.info("Finished: generated=%d skipped=%d failed=%d file=%s", successes, skipped, failures, output)
+    LOG.info("Finished: generated=%d skipped=%d failed=%d total=%d file=%s",
+             successes, skipped, failures, len(done), output)
+    if selected_ids is not None and args.target_total and len(done) < args.target_total:
+        LOG.warning("Target not yet reached (%d/%d). Run again with --resume and the same plan settings.",
+                    len(done), args.target_total)
 
 
 if __name__ == "__main__":
