@@ -66,7 +66,13 @@ def normalized(s):
 def predicted_class(raw, labels):
     # Strict classification: don't count mentions buried in explanations or
     # clinical evidence; report out-of-vocabulary outputs explicitly.
-    t = raw.strip().splitlines()[0].strip() if raw.strip() else ""
+    cleaned = raw.strip()
+
+    # Gemma 4 may leave this channel label in decoded output.
+    if cleaned.startswith("thought\n"):
+        cleaned = cleaned[len("thought\n"):].strip()
+
+    t = cleaned.splitlines()[0].strip() if cleaned else ""
     t = re.sub(r"^(?:diagnosis|answer)\s*:\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"^(?:the most likely diagnosis is|most likely diagnosis is)\s+", "", t, flags=re.IGNORECASE)
     lookup = {normalized(label): label for label in labels}
