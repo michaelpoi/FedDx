@@ -16,6 +16,7 @@ dependencies = [
     "safetensors>=0.8.0",
     "scikit-learn>=1.9.1",
     "sentencepiece>=0.2.2",
+    "shap>=0.54.1",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
     "transformers>=5.10.1",

@@ -115,15 +115,15 @@ def render_confidence_html(stats: dict[str, Any] | None, *, cached: bool = False
     minpct = 100 * float(stats["minimum_token_probability"])
     jointpct = 100 * float(stats["joint_diagnosis_token_probability"])
     count = int(stats["number_of_diagnosis_tokens"])
-    return f"""<div style="border-radius:12px;padding:15px;background:{bg};color:{fg}">
-      <div style="font-size:0.82em;font-weight:700">{band} TOKEN CONFIDENCE · UNCALIBRATED</div>
-      <div style="font-size:1.9em;font-weight:750;margin-top:3px">{pct:.1f}%</div>
+    return f"""<div class="feddx-confidence" style="border-radius:12px;padding:15px;background:{bg};color:#111827 !important;-webkit-text-fill-color:#111827 !important">
+      <div style="font-size:0.82em;font-weight:700;color:#111827 !important;-webkit-text-fill-color:#111827 !important">{band} TOKEN CONFIDENCE · UNCALIBRATED</div>
+      <div style="font-size:1.9em;font-weight:750;margin-top:3px;color:#111827 !important;-webkit-text-fill-color:#111827 !important">{pct:.1f}%</div>
       <div style="height:9px;background:#ffffffbb;border-radius:6px;margin:8px 0;overflow:hidden">
         <div style="height:100%;width:{pct:.3f}%;background:{fg};border-radius:6px"></div>
       </div>
-      <div style="font-size:0.86em">Geometric mean probability of {count} generated diagnosis tokens</div>
-      <div style="font-size:0.84em;margin-top:10px">Weakest token: <b>{minpct:.1f}%</b> &nbsp;·&nbsp;
+      <div style="font-size:0.86em;color:#111827 !important;-webkit-text-fill-color:#111827 !important">Geometric mean probability of {count} generated diagnosis tokens</div>
+      <div style="font-size:0.84em;margin-top:10px;color:#111827 !important;-webkit-text-fill-color:#111827 !important">Weakest token: <b>{minpct:.1f}%</b> &nbsp;·&nbsp;
            Whole diagnosis token sequence: <b>{jointpct:.1f}%</b></div>
-      <div style="font-size:0.79em;margin-top:9px">Colors use illustrative 50% / 80% thresholds.
+      <div style="font-size:0.79em;margin-top:9px;color:#111827 !important;-webkit-text-fill-color:#111827 !important">Colors use illustrative 50% / 80% thresholds.
         This is <b>not</b> a calibrated probability that the diagnosis is correct.</div>
     </div>"""
