@@ -276,7 +276,7 @@ class FedDxApp:
                 raw = processor.tokenizer.decode(completion_ids, skip_special_tokens=True,
                                                  clean_up_tokenization_spaces=False)
                 prediction, valid = parse_diagnosis(raw, self.vocabulary)
-                if valid:
+                if prediction and prediction != "(empty response)":
                     self._last_prediction[(pid, choice)] = (prediction, clinical_summary)
                 try:
                     stats = score_generated_diagnosis(
