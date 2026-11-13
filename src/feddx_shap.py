@@ -19,7 +19,7 @@ def split_clinical_text(text: str, max_features: int = 16) -> list[str]:
     if not text.strip():
         raise ValueError('Empty clinical summary')
     # Use sentence and clause boundaries, preserving all original whitespace.
-    matches = re.findall(r'[^,;.!?\n]+(?:[,;.!?]+|\n+|$)', text)
+    matches = re.findall(r'[^,;.!?\n]+(?:[,;.!?]+\n*|\n+|$)|\n+', text)
     chunks = [m for m in matches if m]
     if ''.join(chunks) != text:
         chunks = [text]
