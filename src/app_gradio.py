@@ -3,7 +3,8 @@
 
 Run from the FedDx project root:
     uv add gradio
-    uv run python src/app_gradio_fixed.py
+    uv run python src/app_gradio.py
+    uv run python src/app_gradio.py --deferral-policy runs/trust/token_5k/deferral_policy.json
 
 Live inference additionally requires torch, transformers, peft, accelerate,
 including bitsandbytes and access to google/gemma-4-12B-it.
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from feddx_confidence import render_confidence_html, score_generated_diagnosis
+from feddx_deferral import assign_zone, load_policy, render_zone_html
 from feddx_shap import explain_summary, render_shap_html, attribution_rows
 
 PROMPT = (
@@ -118,8 +120,11 @@ def parse_diagnosis(raw: str, vocabulary: set[str]) -> tuple[str, bool]:
 
 
 class FedDxApp:
-    def __init__(self, cases: dict[str, dict[str, Any]], model_name: str, cache_paths: dict[str, list[Path]]):
+    def __init__(self, cases: dict[str, dict[str, Any]], model_name: str, cache_paths: dict[str, list[Path]],
+                 deferral_policy: dict[str, Any] | None = None):
         self.cases = cases
+        # Calibrated deferral policy fitted by evaluate_trust.py on the token score.
+        self.deferral_policy = deferral_policy
         self.ids = sorted(cases)
         self.vocabulary = {r["target"]["diagnosis"] for r in cases.values()}
         self.model_name = model_name
@@ -285,9 +290,14 @@ class FedDxApp:
                     )
                 except Exception as score_error:
                     stats = {"available": False, "reason": f"Token scoring failed: {type(score_error).__name__}"}
+                zone_html = ""
+                if self.deferral_policy is not None:
+                    score = stats.get("geometric_mean_token_probability") if stats.get("available") else None
+                    zone, calibrated = assign_zone(self.deferral_policy, score, valid)
+                    zone_html = render_zone_html(self.deferral_policy, zone, calibrated)
                 return (
                     prediction,
-                    render_confidence_html(stats),
+                    render_confidence_html(stats) + zone_html,
                     raw,
                     (f"**Source:** live Gemma inference · **Allowed diagnosis label:** {'yes' if valid else 'no'}. "
                      + ("**Input:** edited clinical summary. " if is_modified else "**Input:** original clinical summary. ")
@@ -449,8 +459,16 @@ def main():
     parser.add_argument("--model", default="google/gemma-4-12B-it")
     parser.add_argument("--host", default="127.0.0.1", help="Default is private loopback only")
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--deferral-policy", type=Path, default=None,
+                        help="deferral_policy.json from evaluate_trust.py (token score) to show the deferral zone")
     args = parser.parse_args()
-    controller = FedDxApp(read_test_cases(args.data), args.model, CACHE_CHOICES)
+    policy = None
+    if args.deferral_policy is not None:
+        policy = load_policy(args.deferral_policy)
+        if policy["score"] != "token":
+            parser.error("The app computes the token score live; fit the policy on evaluate_feddx_confidence output")
+        print(f"Deferral policy: accept >= {policy['accept_threshold']}, stop < {policy['stop_threshold']}", flush=True)
+    controller = FedDxApp(read_test_cases(args.data), args.model, CACHE_CHOICES, policy)
     print(f"Loaded {len(controller.ids)} test patients from {args.data}", flush=True)
     build_ui(controller).queue(default_concurrency_limit=1).launch(
         server_name=args.host, server_port=args.port, share=False, show_error=True

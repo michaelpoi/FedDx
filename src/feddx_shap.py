@@ -19,7 +19,10 @@ def split_clinical_text(text: str, max_features: int = 16) -> list[str]:
     if not text.strip():
         raise ValueError('Empty clinical summary')
     # Use sentence and clause boundaries, preserving all original whitespace.
-    matches = re.findall(r'[^,;.!?\n]+(?:[,;.!?]+\n*|\n+|$)|\n+', text)
+    # Each clause keeps its delimiter plus any following whitespace/newlines,
+    # so "male.\nPresenting" splits cleanly (the old pattern failed on ".\n",
+    # which every FedDx summary contains, and fell back to word groups).
+    matches = re.findall(r'.*?(?:[,;.!?]+\s*|\n+|$)', text, flags=re.S)
     chunks = [m for m in matches if m]
     if ''.join(chunks) != text:
         chunks = [text]
@@ -84,11 +87,14 @@ def diagnosis_log_likelihood(model: Any, processor: Any, prompt_template: str,
 
 def explain_summary(model: Any, processor: Any, prompt_template: str, summary: str,
                     diagnosis: str, *, max_features: int = 12,
-                    permutations: int = 2, seed: int = 42) -> dict[str, Any]:
+                    permutations: int = 2, seed: int = 42,
+                    cache: dict[tuple[int, ...], float] | None = None) -> dict[str, Any]:
     """Compute phrase SHAP on diagnosis log P using masked-out phrases.
 
     SHAP's model input is a binary mask of present chunks; the baseline is
-    the all-absent summary. We cache coalition model evaluations.
+    the all-absent summary. We cache coalition model evaluations. Pass a
+    `cache` dict to reuse those evaluations afterwards (e.g. deletion tests);
+    it is only valid for the same summary, diagnosis, model and max_features.
     """
     import numpy as np
     import shap
@@ -100,7 +106,8 @@ def explain_summary(model: Any, processor: Any, prompt_template: str, summary: s
         raise ValueError('At least two text chunks are needed for SHAP')
     if not 1 <= permutations <= 20:
         raise ValueError('permutations must be between 1 and 20')
-    cache: dict[tuple[int, ...], float] = {}
+    if cache is None:
+        cache = {}
 
     def evaluate(mask_matrix):
         result = []
@@ -150,7 +157,6 @@ def render_shap_html(result: dict[str, Any] | None) -> str:
             f'<b style="color:#111827!important">Red</b>: supports the predicted label &nbsp; '
             f'<b style="color:#111827!important">Blue</b>: opposes it &nbsp; '
             f'Intensity = relative SHAP magnitude. These are not clinical importance ratings.</div>')
-
 
 def attribution_rows(result: dict[str, Any]) -> list[list[str]]:
     indexed = sorted(zip(result['chunks'], result['shap_values']),

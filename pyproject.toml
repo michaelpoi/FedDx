@@ -21,3 +21,8 @@ dependencies = [
     "torchvision>=0.29.1",
     "transformers>=5.10.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

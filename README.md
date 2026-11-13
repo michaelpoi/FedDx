@@ -92,6 +92,63 @@ uv run python src/evaluate_gemma4_diagnoses.py \
 
 Predictions are stored incrementally and reused when an evaluation is rerun with identical configuration. Results include `predictions.jsonl`, `metrics.json`, per-class classification reports, and confusion matrices. The open-ended protocol requires an exact DDXPlus label (unless conservative normalization is reported separately), so out-of-vocabulary responses count as incorrect.
 
+## Trust and explainability evidence
+
+Three additions turn the prediction, confidence score and SHAP view into tested evidence.
+
+| Component | Question it answers | Script | Hardware |
+|---|---|---|---|
+| Calibration + deferral | Can the confidence score decide when a clinician must review? | `src/evaluate_trust.py` | CPU |
+| Subgroup behaviour | Do accuracy and deferral rates differ by sex or age band? | `src/evaluate_trust.py` | CPU |
+| SHAP faithfulness | Do the clauses SHAP highlights actually drive the prediction? | `src/shap_faithfulness.py` | GPU |
+
+**1. Token confidence on enough cases.** The deployed model is ~98% accurate, so calibration needs ~1,000 cases per split to contain enough errors. Fit on validation, evaluate on test:
+
+```bash
+uv run python src/evaluate_feddx_confidence.py --model-id 5000 --split validate --n 1000 \
+  --adapter-root runs/gemma4_qlora_independent
+uv run python src/evaluate_feddx_confidence.py --model-id 5000 --split test --n 1000 \
+  --adapter-root runs/gemma4_qlora_independent
+```
+
+**2. Calibration, deferral zones, subgroups (CPU):**
+
+```bash
+uv run python src/evaluate_trust.py \
+  --calib runs/feddx_confidence/validate/stage-5000/n1000_seed42/predictions.jsonl \
+  --eval  runs/feddx_confidence/test/stage-5000/n1000_seed42/predictions.jsonl \
+  --output-dir runs/trust/token_5k
+```
+
+Platt scaling and the deferral thresholds are fitted on validation only. Auto-accept requires the Wilson 95% lower bound of accepted accuracy to reach `--target-accuracy` (default 0.95); calibrated P(correct) below `--stop-threshold` (default 0.5), an invalid label, or a missing score means safe stop; everything else goes to clinician review. Outputs: `trust_report.md`, `reliability_diagram.png`, `risk_coverage.png`, `subgroups.png`, `subgroups.csv`, `zones.csv`, `deferral_policy.json`.
+
+The same script accepts closed-set predictions, which already exist and contain more errors (one file is split 50/50 into calibration and evaluation halves when `--eval` is omitted):
+
+```bash
+uv run python src/evaluate_trust.py \
+  --calib runs/gemma4_evaluation_closed_set/validate/stage-5000/predictions.jsonl \
+  --output-dir runs/trust/closed_set_5k
+```
+
+**3. SHAP deletion test (GPU, ~20 cases):**
+
+```bash
+uv run python src/shap_faithfulness.py --model-id 5000 \
+  --adapter-root runs/gemma4_qlora_independent --n 20
+```
+
+For k = 1..3 it removes the top-k SHAP clauses, k random clauses, and the bottom-k SHAP clauses, and reports the drop in log P(predicted diagnosis), a paired bootstrap CI and one-sided Wilcoxon test (top vs random), and how often the predicted label changes. Faithful attributions give clearly larger top-k drops than random drops. Outputs: `faithfulness_report.md`, `deletion_curve.png`, `cases.jsonl`, `summary.json`. Use `--no-flip-test` to skip re-generation, `--reports-only` to rebuild reports on CPU.
+
+**4. App:** show the calibrated deferral zone next to each live prediction:
+
+```bash
+uv run python src/app_gradio.py --deferral-policy runs/trust/token_5k/deferral_policy.json
+```
+
+**Tests (CPU):** `uv add --dev pytest && uv run pytest -q tests`
+
+**SHAP chunking fix:** `split_clinical_text` previously failed on the `.\n` after the demographic line, which every summary contains, and fell back to fixed word groups that cut through clauses ("Chest | pain that is"). It now splits on clause boundaries. SHAP results computed before this fix used word groups.
+
 ## Status and limitations
 
 - **Completed:** 5k training set, 1k validation set, 2k held-out test set; independent 1k and 5k adapters; validation open-ended and closed-set comparisons.
