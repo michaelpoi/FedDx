@@ -20,13 +20,6 @@ For each sampled case:
 SHAP is faithful to the model (in this sense) if top-k drops are clearly larger
 than random drops. This measures explanation fidelity, not clinical validity.
 
-Run from the FedDx root (GPU):
-  uv run python src/shap_faithfulness.py --model-id 5000 \
-      --adapter-root runs/gemma4_qlora_independent --n 20
-
-Reports only (CPU, from saved cases):
-  uv run python src/shap_faithfulness.py --model-id 5000 --n 20 --reports-only
-
 Each completed case is appended to cases.jsonl; reruns resume.
 """
 from __future__ import annotations

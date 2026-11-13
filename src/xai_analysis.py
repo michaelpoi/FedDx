@@ -22,13 +22,6 @@ Three analyses on top of the fine-tuned Gemma 4 diagnosis model:
 GPU stage (SHAP) and report stage (alignment, plausibility, global, figures) are
 separate: --reports-only re-runs alignment with new settings without a GPU.
 
-Run from the FedDx project root:
-  uv run python src/xai_analysis.py --model-id 5000 --split test --per-class 4 \
-      --adapter-root runs/gemma4_qlora_independent \
-      --predictions runs/gemma4_evaluation_test/test/stage-5000/predictions.jsonl \
-      --all-errors
-  uv run python src/xai_analysis.py ... --reports-only --aligner embed
-
 Scoring uses the TRAINING-matched chat rendering (completed assistant turn),
 the same format as train_gemma4_qlora.py, feddx_shap.py and the open-ended
 evaluator. SHAP values describe model behavior, not clinical truth or causality.

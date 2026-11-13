@@ -6,11 +6,7 @@ at application time.
 
 A deferral policy maps an uncalibrated confidence score to a calibrated
 probability that the predicted label is correct (Platt scaling), then to one of
-three zones:
-
-  AUTO_ACCEPT   calibrated p >= accept_threshold
-  REVIEW        stop_threshold <= p < accept_threshold  -> clinician review
-  SAFE_STOP     p < stop_threshold, invalid label, or no score -> no model output shown as a diagnosis
+three zones (AUTO_ACCEPT, REVIEW, SAFE_STOP); see the README for the zone table.
 
 Thresholds are fitted on a calibration split and must be evaluated on a
 separate split. They describe synthetic DDXPlus behaviour only.

@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """Evaluate open-ended Gemma 4 diagnosis-token confidence on a test sample.
 
-From the FedDx repository root:
-  uv run python src/evaluate_feddx_confidence.py --model-id 5000 --n 100 \
-      --adapter-root runs/gemma4_qlora_independent
-  uv run python src/evaluate_feddx_confidence.py --model-id vanilla --n 100
-
 Each completed prediction is appended to JSONL. An input/model configuration
 manifest prevents silently mixing incompatible runs. Reports can be regenerated
 without a GPU using --reports-only.
